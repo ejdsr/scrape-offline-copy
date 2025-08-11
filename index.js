@@ -4,6 +4,7 @@ const path = require('path');
 const { URL } = require('url');
 const https = require('https');
 const http = require('http');
+const zlib = require('zlib');
 
 class WebsiteScraper {
     constructor(baseUrl, outputDir = 'scraped-site') {
@@ -18,7 +19,7 @@ class WebsiteScraper {
         this.sitemap = new Map(); // URL -> { title, links, resources, timestamp }
     }
 
-    async downloadResource(url, outputPath) {
+    async downloadResource(url, outputPath, page = null) {
         if (this.downloadedResources.has(url)) {
             console.log(`Skipping already downloaded: ${path.basename(outputPath)}`);
             return true; // Already downloaded
@@ -42,21 +43,69 @@ class WebsiteScraper {
             
             console.log(`Starting download: ${url} -> ${outputPath}`);
             
-            return new Promise((resolve, reject) => {
+            return new Promise(async (resolve, reject) => {
                 const file = fs.createWriteStream(outputPath);
                 
-                const request = protocol.get(url, {
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                // Get cookies from current browser session if page is available
+                let cookieHeader = '';
+                if (page) {
+                    try {
+                        const cookies = await page.cookies(url);
+                        if (cookies.length > 0) {
+                            cookieHeader = cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
+                        }
+                    } catch (cookieError) {
+                        console.log(`Could not get cookies for ${url}: ${cookieError.message}`);
                     }
-                }, (response) => {
+                }
+                
+                const headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/css,*/*;q=0.1',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1'
+                };
+                
+                if (cookieHeader) {
+                    headers['Cookie'] = cookieHeader;
+                }
+                
+                const request = protocol.get(url, { headers }, (response) => {
                     if (response.statusCode === 200) {
-                        response.pipe(file);
+                        let downloadedBytes = 0;
+                        let stream = response;
+                        
+                        // Handle gzip compression
+                        const encoding = response.headers['content-encoding'];
+                        if (encoding === 'gzip') {
+                            console.log(`  Decompressing gzip content for: ${path.basename(outputPath)}`);
+                            stream = response.pipe(zlib.createGunzip());
+                        } else if (encoding === 'deflate') {
+                            console.log(`  Decompressing deflate content for: ${path.basename(outputPath)}`);
+                            stream = response.pipe(zlib.createInflate());
+                        } else if (encoding === 'br') {
+                            console.log(`  Decompressing brotli content for: ${path.basename(outputPath)}`);
+                            stream = response.pipe(zlib.createBrotliDecompress());
+                        }
+                        
+                        stream.on('data', (chunk) => {
+                            downloadedBytes += chunk.length;
+                        });
+                        
+                        stream.pipe(file);
                         file.on('finish', () => {
                             file.close();
                             this.downloadedResources.add(url);
-                            console.log(`Downloaded resource: ${path.basename(outputPath)} (${response.headers['content-type'] || 'unknown type'})`);
+                            console.log(`Downloaded resource: ${path.basename(outputPath)} (${downloadedBytes} bytes, ${response.headers['content-type'] || 'unknown type'})`);
                             resolve(true);
+                        });
+                        
+                        stream.on('error', (err) => {
+                            file.close();
+                            fs.unlink(outputPath).catch(() => {}); // Clean up on error
+                            reject(err);
                         });
                     } else if (response.statusCode === 301 || response.statusCode === 302) {
                         // Handle redirects
@@ -71,8 +120,10 @@ class WebsiteScraper {
                             reject(new Error(`Redirect without location header: ${response.statusCode}`));
                         }
                     } else {
+                        console.log(`Failed to download ${url}: HTTP ${response.statusCode}`);
                         file.close();
-                        reject(new Error(`HTTP ${response.statusCode}`));
+                        fs.unlink(outputPath).catch(() => {}); // Clean up empty file
+                        resolve(false);
                     }
                 });
                 
@@ -127,7 +178,7 @@ class WebsiteScraper {
                             
                             console.log(`  Downloading CSS resource: ${absoluteUrl} -> ${localPath}`);
                             
-                            if (await this.downloadResource(absoluteUrl, fullPath)) {
+                            if (await this.downloadResource(absoluteUrl, fullPath, this.page)) {
                                 // Update the CSS content with the local path
                                 const relativePath = path.relative(path.dirname(cssFilePath), fullPath).replace(/\\/g, '/');
                                 modifiedCss = modifiedCss.replace(match, `url('${relativePath}')`);
@@ -526,9 +577,19 @@ class WebsiteScraper {
                         
                         console.log(`Downloading: ${resource.url} -> ${localPath}`);
                         
-                        if (await this.downloadResource(resource.url, fullPath)) {
+                        if (await this.downloadResource(resource.url, fullPath, this.page)) {
                             resourceMap.set(resource.url, localPath);
                             downloadedCount++;
+                            
+                            // If it's a CSS file, process it for additional resources
+                            if (resource.type === 'css' && localPath.endsWith('.css')) {
+                                console.log(`  Processing CSS file for additional resources: ${fullPath}`);
+                                try {
+                                    await this.processCssFile(fullPath, resource.url);
+                                } catch (cssError) {
+                                    console.error(`  Error processing CSS file ${fullPath}:`, cssError.message);
+                                }
+                            }
                         }
                     } else {
                         console.log(`Skipping external resource: ${resource.url}`);
@@ -558,7 +619,7 @@ class WebsiteScraper {
             }
 
             // Get the page content and modify links
-            const content = await this.page.evaluate((baseDomain, resourceMapping) => {
+            const content = await this.page.evaluate((baseDomain, resourceMapping, currentPagePath) => {
                 // Helper function to convert URL to file path (injected)
                 function urlToFilePath(url) {
                     try {
@@ -649,6 +710,20 @@ class WebsiteScraper {
                     
                     let replacedCount = 0;
                     
+                    // Helper function to make path relative to current page
+                    function makeRelativePath(localPath) {
+                        // Calculate how many levels deep the current page is
+                        const pageDepth = currentPagePath.split('/').length - 1;
+                        
+                        // If we're in a subfolder, add '../' for each level
+                        if (pageDepth > 0) {
+                            const relativePath = '../'.repeat(pageDepth) + localPath;
+                            return relativePath;
+                        }
+                        
+                        return localPath;
+                    }
+                    
                     // Handle srcset specially (contains multiple URLs)
                     if (attribute === 'srcset') {
                         const srcsetParts = originalValue.split(',').map(part => part.trim());
@@ -661,7 +736,7 @@ class WebsiteScraper {
                             // Check all URL variations for replacement
                             for (const [urlVariation, localPath] of urlVariations) {
                                 if (url === urlVariation || url.endsWith(urlVariation.replace(/^\//, ''))) {
-                                    newUrl = localPath;
+                                    newUrl = makeRelativePath(localPath);
                                     replacedCount++;
                                     break;
                                 }
@@ -684,7 +759,7 @@ class WebsiteScraper {
                         
                         for (const [urlVariation, localPath] of urlVariations) {
                             const urlPattern = new RegExp(`url\\(['"]?${urlVariation.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]?\\)`, 'g');
-                            const newStyleTest = newStyle.replace(urlPattern, `url('${localPath}')`);
+                            const newStyleTest = newStyle.replace(urlPattern, `url('${makeRelativePath(localPath)}')`);
                             if (newStyleTest !== newStyle) {
                                 newStyle = newStyleTest;
                                 replacedCount++;
@@ -703,8 +778,8 @@ class WebsiteScraper {
                     // Check exact matches first
                     for (const [urlVariation, localPath] of urlVariations) {
                         if (originalValue === urlVariation) {
-                            element.setAttribute(attribute, localPath);
-                            console.log(`Replaced ${attribute}: ${originalValue} -> ${localPath}`);
+                            element.setAttribute(attribute, makeRelativePath(localPath));
+                            console.log(`Replaced ${attribute}: ${originalValue} -> ${makeRelativePath(localPath)}`);
                             return true;
                         }
                     }
@@ -719,8 +794,8 @@ class WebsiteScraper {
                             if (originalValue === urlObj.pathname || 
                                 originalValue === pathWithoutLeadingSlash ||
                                 originalValue.endsWith('/' + pathWithoutLeadingSlash)) {
-                                element.setAttribute(attribute, localPath);
-                                console.log(`Replaced ${attribute} (path match): ${originalValue} -> ${localPath}`);
+                                element.setAttribute(attribute, makeRelativePath(localPath));
+                                console.log(`Replaced ${attribute} (path match): ${originalValue} -> ${makeRelativePath(localPath)}`);
                                 return true;
                             }
                         } catch (e) {}
@@ -783,8 +858,22 @@ class WebsiteScraper {
                 
                 console.log(`Total URLs replaced: ${replacedCount}`);
                 
+                // Remove or fix problematic base tags that break relative URLs in offline browsing
+                const baseTags = document.querySelectorAll('base[href]');
+                baseTags.forEach(baseTag => {
+                    const baseHref = baseTag.getAttribute('href');
+                    console.log(`Found base tag with href: ${baseHref}`);
+                    
+                    // If base href is an absolute path (starts with /) or full URL, 
+                    // it will break relative resource loading in offline browsing
+                    if (baseHref && (baseHref.startsWith('/') || baseHref.includes('://'))) {
+                        console.log(`Removing problematic base tag: ${baseHref}`);
+                        baseTag.remove();
+                    }
+                });
+                
                 return document.documentElement.outerHTML;
-            }, this.baseDomain, Object.fromEntries(resourceMap));
+            }, this.baseDomain, Object.fromEntries(resourceMap), this.urlToFilePath(url));
 
             // Save the modified content
             const filePath = this.urlToFilePath(url);
@@ -1059,7 +1148,7 @@ async function main() {
     
     if (args.length === 0) {
         console.log('Usage: node index.js <website-url> [output-directory]');
-        console.log('Example: node index.js https://climate-adapt.eea.europa.eu/ my-scraped-site');
+        console.log('Example: node index.js https://projectgreeneo.eu/ my-scraped-site');
         process.exit(1);
     }
     
