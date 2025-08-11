@@ -30,13 +30,13 @@ npm start <website-url> [output-directory]
 ### Examples
 ```bash
 # Scrape the climate-adapt website to default directory 'scraped-site'
-npm start https://climate-adapt.eea.europa.eu/
+npm start https://projectgreeneo.eu/
 
 # Scrape to a custom directory
-npm start https://climate-adapt.eea.europa.eu/ climate-adapt-offline
+npm start https://projectgreeneo.eu/ offline-copy
 
 # Run directly with node
-node index.js https://climate-adapt.eea.europa.eu/ my-output-folder
+node index.js https://projectgreeneo.eu/ my-output-folder
 ```
 
 ## How it Works

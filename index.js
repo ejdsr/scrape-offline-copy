@@ -314,7 +314,10 @@ class WebsiteScraper {
             let newLinksAdded = 0;
             for (const link of links) {
                 if (this.shouldScrapeUrl(link)) {
-                    this.pendingUrls.add(link);
+                    // Clean the URL before adding to pending list
+                    const linkObj = new URL(link);
+                    const cleanUrl = `${linkObj.protocol}//${linkObj.hostname}${linkObj.pathname}${linkObj.search}`;
+                    this.pendingUrls.add(cleanUrl);
                     newLinksAdded++;
                 }
             }
@@ -800,13 +803,16 @@ class WebsiteScraper {
                 return false;
             }
             
-            // Skip already visited URLs
-            if (this.visitedUrls.has(url)) {
+            // Clean up the URL by removing hash fragments and creating a clean URL
+            const cleanUrl = `${urlObj.protocol}//${urlObj.hostname}${urlObj.pathname}${urlObj.search}`;
+            
+            // Skip already visited URLs (check both original and clean URL)
+            if (this.visitedUrls.has(url) || this.visitedUrls.has(cleanUrl)) {
                 return false;
             }
             
-            // Skip URLs that are already pending
-            if (this.pendingUrls.has(url)) {
+            // Skip URLs that are already pending (check both original and clean URL)
+            if (this.pendingUrls.has(url) || this.pendingUrls.has(cleanUrl)) {
                 return false;
             }
             
@@ -824,6 +830,11 @@ class WebsiteScraper {
             
             // Skip anchors that point to the same page (just different sections)
             if (urlObj.hash && urlObj.pathname === new URL(this.baseUrl).pathname && !urlObj.search) {
+                return false;
+            }
+            
+            // Skip URLs that end with just a hash (like "/page#")
+            if (url.endsWith('#')) {
                 return false;
             }
             
