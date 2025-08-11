@@ -15,6 +15,7 @@ class WebsiteScraper {
         this.downloadedResources = new Set();
         this.browser = null;
         this.page = null;
+        this.sitemap = new Map(); // URL -> { title, links, resources, timestamp }
     }
 
     async downloadResource(url, outputPath) {
@@ -193,6 +194,12 @@ class WebsiteScraper {
                         pathname += '.js';
                     } else if (pathname.includes('/img/') || pathname.includes('/images/') || pathname.includes('image')) {
                         pathname += '.png'; // Default image extension
+                    } else if (pathname.includes('/pdf/') || pathname.includes('document')) {
+                        pathname += '.pdf';
+                    } else if (pathname.includes('/video/') || pathname.includes('mp4')) {
+                        pathname += '.mp4';
+                    } else if (pathname.includes('/audio/') || pathname.includes('mp3')) {
+                        pathname += '.mp3';
                     } else {
                         pathname += '.resource'; // Default extension
                     }
@@ -269,6 +276,9 @@ class WebsiteScraper {
             console.log(`\\nScraping completed! ${this.visitedUrls.size} pages scraped.`);
             console.log(`Files saved to: ${path.resolve(this.outputDir)}`);
             
+            // Generate sitemap
+            await this.generateSitemap();
+            
         } catch (error) {
             console.error('Error during scraping:', error);
         } finally {
@@ -292,9 +302,9 @@ class WebsiteScraper {
             await new Promise(resolve => setTimeout(resolve, 2000));
 
             // Extract all links from the page before modifying content
-            const links = await this.page.evaluate(() => {
+            const pageData = await this.page.evaluate(() => {
                 const anchors = Array.from(document.querySelectorAll('a[href]'));
-                return anchors.map(anchor => {
+                const links = anchors.map(anchor => {
                     const href = anchor.getAttribute('href');
                     if (href) {
                         // Convert relative URLs to absolute URLs
@@ -306,13 +316,19 @@ class WebsiteScraper {
                     }
                     return null;
                 }).filter(link => link !== null);
+                
+                // Get page title
+                const title = document.title || 'Untitled Page';
+                
+                return { links, title };
             });
 
-            console.log(`Found ${links.length} links on ${url}`);
+            console.log(`Found ${pageData.links.length} links on ${url}`);
+            console.log(`Page title: ${pageData.title}`);
 
             // Filter and add new URLs to pending list
             let newLinksAdded = 0;
-            for (const link of links) {
+            for (const link of pageData.links) {
                 if (this.shouldScrapeUrl(link)) {
                     // Clean the URL before adding to pending list
                     const linkObj = new URL(link);
@@ -460,6 +476,25 @@ class WebsiteScraper {
                     }
                 });
                 
+                // PDF and document links
+                document.querySelectorAll('a[href]').forEach(link => {
+                    const href = link.getAttribute('href');
+                    if (href) {
+                        try {
+                            const url = new URL(href, window.location.href).href;
+                            const ext = url.split('.').pop().toLowerCase().split('?')[0];
+                            if (['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'zip', 'rar', 'mp4', 'mp3', 'wav', 'avi', 'mov', 'wmv', 'flv', 'webm', 'ogg'].includes(ext)) {
+                                resourceUrls.push({
+                                    url: url,
+                                    type: 'document',
+                                    element: 'a',
+                                    attribute: 'href'
+                                });
+                            }
+                        } catch (e) {}
+                    }
+                });
+                
                 return resourceUrls;
             });
 
@@ -504,6 +539,14 @@ class WebsiteScraper {
             }
             
             console.log(`Downloaded ${downloadedCount} resources successfully`);
+
+            // Store sitemap data for this page
+            this.sitemap.set(url, {
+                title: pageData.title,
+                links: pageData.links,
+                resources: Array.from(resourceMap.keys()),
+                timestamp: new Date().toISOString()
+            });
 
             // Process CSS files after all resources are downloaded
             console.log('Processing CSS files for background images...');
@@ -816,8 +859,8 @@ class WebsiteScraper {
                 return false;
             }
             
-            // Skip certain file types (but we'll download them as resources)
-            const skipExtensions = ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.css', '.js', '.ico', '.svg', '.zip', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'];
+            // Skip certain file types for page scraping (but we'll download them as resources)
+            const skipExtensions = ['.pdf', '.jpg', '.jpeg', '.png', '.gif', '.css', '.js', '.ico', '.svg', '.zip', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.mp4', '.mp3', '.wav', '.avi', '.mov', '.wmv', '.flv', '.webm', '.ogg'];
             const pathname = urlObj.pathname.toLowerCase();
             if (skipExtensions.some(ext => pathname.endsWith(ext))) {
                 return false;
@@ -872,6 +915,141 @@ class WebsiteScraper {
         } catch (error) {
             return 'unknown_page';
         }
+    }
+
+    async generateSitemap() {
+        console.log('Generating sitemap...');
+        
+        // Create sitemap data
+        const sitemapData = {
+            baseUrl: this.baseUrl,
+            domain: this.baseDomain,
+            generatedAt: new Date().toISOString(),
+            totalPages: this.sitemap.size,
+            totalResources: this.downloadedResources.size,
+            pages: []
+        };
+        
+        // Convert sitemap to array
+        for (const [url, data] of this.sitemap) {
+            sitemapData.pages.push({
+                url: url,
+                fileName: this.urlToFilePath(url) + '.html',
+                title: data.title,
+                scrapedAt: data.timestamp,
+                links: data.links,
+                resources: data.resources,
+                linkCount: data.links.length,
+                resourceCount: data.resources.length
+            });
+        }
+        
+        // Sort by URL for consistency
+        sitemapData.pages.sort((a, b) => a.url.localeCompare(b.url));
+        
+        // Save JSON sitemap
+        const jsonPath = path.join(this.outputDir, 'sitemap.json');
+        await fs.writeFile(jsonPath, JSON.stringify(sitemapData, null, 2), 'utf8');
+        console.log(`JSON sitemap saved: ${jsonPath}`);
+        
+        // Generate HTML sitemap
+        const htmlSitemap = this.generateHtmlSitemap(sitemapData);
+        const htmlPath = path.join(this.outputDir, 'sitemap.html');
+        await fs.writeFile(htmlPath, htmlSitemap, 'utf8');
+        console.log(`HTML sitemap saved: ${htmlPath}`);
+        
+        return sitemapData;
+    }
+    
+    generateHtmlSitemap(data) {
+        return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sitemap - ${data.domain}</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; }
+        .header { background: #f4f4f4; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 20px; }
+        .stat { background: #e9e9e9; padding: 10px; border-radius: 3px; text-align: center; }
+        .page { margin-bottom: 30px; border: 1px solid #ddd; padding: 15px; border-radius: 5px; }
+        .page-title { font-size: 1.2em; font-weight: bold; margin-bottom: 10px; }
+        .page-url { color: #666; margin-bottom: 10px; font-family: monospace; }
+        .page-info { margin-bottom: 15px; }
+        .links, .resources { margin-top: 10px; }
+        .links h4, .resources h4 { margin: 10px 0 5px 0; color: #333; }
+        .links ul, .resources ul { margin: 0; padding-left: 20px; }
+        .links li, .resources li { margin: 2px 0; }
+        .internal-link { color: #0066cc; }
+        .external-link { color: #cc6600; }
+        .resource-link { color: #009900; }
+        .timestamp { color: #888; font-size: 0.9em; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Website Sitemap</h1>
+        <p><strong>Domain:</strong> ${data.domain}</p>
+        <p><strong>Base URL:</strong> ${data.baseUrl}</p>
+        <p><strong>Generated:</strong> ${new Date(data.generatedAt).toLocaleString()}</p>
+    </div>
+    
+    <div class="stats">
+        <div class="stat">
+            <div><strong>${data.totalPages}</strong></div>
+            <div>Pages Scraped</div>
+        </div>
+        <div class="stat">
+            <div><strong>${data.totalResources}</strong></div>
+            <div>Resources Downloaded</div>
+        </div>
+        <div class="stat">
+            <div><strong>${data.pages.reduce((sum, p) => sum + p.linkCount, 0)}</strong></div>
+            <div>Total Links Found</div>
+        </div>
+    </div>
+    
+    <h2>Pages</h2>
+    ${data.pages.map(page => `
+        <div class="page">
+            <div class="page-title">${page.title}</div>
+            <div class="page-url">
+                <a href="${page.fileName}" class="internal-link">${page.url}</a>
+            </div>
+            <div class="page-info">
+                <span class="timestamp">Scraped: ${new Date(page.scrapedAt).toLocaleString()}</span> | 
+                <strong>${page.linkCount}</strong> links | 
+                <strong>${page.resourceCount}</strong> resources
+            </div>
+            
+            ${page.links.length > 0 ? `
+                <div class="links">
+                    <h4>Links (${page.links.length})</h4>
+                    <ul>
+                        ${page.links.map(link => {
+                            const isInternal = link.startsWith(data.baseUrl) || !link.includes('://');
+                            const className = isInternal ? 'internal-link' : 'external-link';
+                            return `<li><a href="${link}" class="${className}" target="_blank">${link}</a></li>`;
+                        }).join('')}
+                    </ul>
+                </div>
+            ` : ''}
+            
+            ${page.resources.length > 0 ? `
+                <div class="resources">
+                    <h4>Resources (${page.resources.length})</h4>
+                    <ul>
+                        ${page.resources.map(resource => 
+                            `<li><a href="${resource}" class="resource-link" target="_blank">${resource}</a></li>`
+                        ).join('')}
+                    </ul>
+                </div>
+            ` : ''}
+        </div>
+    `).join('')}
+</body>
+</html>`;
     }
 }
 
