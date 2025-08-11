@@ -5,7 +5,7 @@ const { URL } = require('url');
 const https = require('https');
 const http = require('http');
 const zlib = require('zlib');
-
+  
 class WebsiteScraper {
     constructor(baseUrl, outputDir = 'scraped-site') {
         this.baseUrl = baseUrl;
@@ -619,16 +619,31 @@ class WebsiteScraper {
             }
 
             // Get the page content and modify links
-            const content = await this.page.evaluate((baseDomain, resourceMapping, currentPagePath) => {
+            const content = await this.page.evaluate((baseDomain, resourceMapping, currentPagePath, baseUrl) => {
                 // Helper function to convert URL to file path (injected)
                 function urlToFilePath(url) {
                     try {
                         const urlObj = new URL(url);
-                        let pathname = urlObj.pathname;
+                        const baseUrlObj = new URL(baseUrl);
                         
-                        // Remove leading slash
+                        let pathname = urlObj.pathname;
+                        let basePathname = baseUrlObj.pathname;
+                        
+                        // Remove leading slash from both paths
                         if (pathname.startsWith('/')) {
                             pathname = pathname.substring(1);
+                        }
+                        if (basePathname.startsWith('/')) {
+                            basePathname = basePathname.substring(1);
+                        }
+                        
+                        // If the base URL has a path (like /en/), remove it from the pathname to avoid duplication
+                        if (basePathname && pathname.startsWith(basePathname)) {
+                            pathname = pathname.substring(basePathname.length);
+                            // Remove leading slash if it exists after removing base path
+                            if (pathname.startsWith('/')) {
+                                pathname = pathname.substring(1);
+                            }
                         }
                         
                         // If pathname is empty or ends with '/', treat as index
@@ -872,8 +887,69 @@ class WebsiteScraper {
                     }
                 });
                 
+                // Remove or disable JavaScript that might cause connectivity issues offline
+                // Be more selective - only remove scripts that cause connectivity errors
+                const scriptTags = document.querySelectorAll('script[src], script:not([src])');
+                let removedScripts = 0;
+                scriptTags.forEach(script => {
+                    const src = script.getAttribute('src');
+                    const content = script.textContent || '';
+                    
+                    // Only remove scripts that are clearly problematic for offline usage
+                    let shouldRemove = false;
+                    
+                    // Remove external scripts (they won't work offline anyway)
+                    if (src && !src.startsWith('/') && !src.startsWith('./') && !src.startsWith('../')) {
+                        // External script (different domain)
+                        try {
+                            const scriptUrl = new URL(src, window.location.href);
+                            if (scriptUrl.hostname !== window.location.hostname) {
+                                shouldRemove = true;
+                            }
+                        } catch (e) {
+                            shouldRemove = true;
+                        }
+                    }
+                    
+                    // Remove analytics and tracking scripts
+                    if (src && (
+                        src.includes('analytics') || 
+                        src.includes('gtag') || 
+                        src.includes('google-analytics') ||
+                        src.includes('matomo') ||
+                        src.includes('tracking')
+                    )) {
+                        shouldRemove = true;
+                    }
+                    
+                    // Remove inline scripts that contain specific problematic patterns
+                    if (!src && content && (
+                        content.includes('The backend is not responding') ||
+                        content.includes('server timeout') ||
+                        content.includes('connection problem') ||
+                        content.includes('check your connection') ||
+                        (content.includes('fetch(') && content.includes('timeout')) ||
+                        (content.includes('XMLHttpRequest') && content.includes('timeout')) ||
+                        (content.includes('axios') && content.includes('timeout')) ||
+                        content.includes('matomo.eea.europa.eu') ||
+                        (content.includes('api') && content.includes('timeout') && content.length < 5000) // Small API timeout scripts
+                    )) {
+                        shouldRemove = true;
+                    }
+                    
+                    if (shouldRemove) {
+                        console.log(`Removing problematic script: ${src || 'inline script with connectivity issues'}`);
+                        script.remove();
+                        removedScripts++;
+                    }
+                });
+                
+                console.log(`Removed ${removedScripts} problematic scripts (kept functional scripts)`);
+                
+                // Don't add CSP meta tag - let remaining functional JavaScript run
+                
                 return document.documentElement.outerHTML;
-            }, this.baseDomain, Object.fromEntries(resourceMap), this.urlToFilePath(url));
+            }, this.baseDomain, Object.fromEntries(resourceMap), this.urlToFilePath(url), this.baseUrl);
 
             // Save the modified content
             const filePath = this.urlToFilePath(url);
@@ -979,11 +1055,26 @@ class WebsiteScraper {
     urlToFilePath(url) {
         try {
             const urlObj = new URL(url);
-            let pathname = urlObj.pathname;
+            const baseUrlObj = new URL(this.baseUrl);
             
-            // Remove leading slash
+            let pathname = urlObj.pathname;
+            let basePathname = baseUrlObj.pathname;
+            
+            // Remove leading slash from both paths
             if (pathname.startsWith('/')) {
                 pathname = pathname.substring(1);
+            }
+            if (basePathname.startsWith('/')) {
+                basePathname = basePathname.substring(1);
+            }
+            
+            // If the base URL has a path (like /en/), remove it from the pathname to avoid duplication
+            if (basePathname && pathname.startsWith(basePathname)) {
+                pathname = pathname.substring(basePathname.length);
+                // Remove leading slash if it exists after removing base path
+                if (pathname.startsWith('/')) {
+                    pathname = pathname.substring(1);
+                }
             }
             
             // If pathname is empty or ends with '/', treat as index

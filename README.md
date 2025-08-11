@@ -12,6 +12,7 @@ A Node.js project that uses Puppeteer to scrape websites and create offline brow
 - Handles dynamic content loading
 - Saves pages as HTML files with modified links
 - **Creates an `assets/` folder** with all downloaded resources
+- might encounter some issues with some pages relying on server calls...
 
 ## Installation
 
